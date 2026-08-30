@@ -11,3 +11,10 @@ __pycache__/
 
 # 参考实现（本地对照用，不入库）
 newapi-checkin/
+CloudflareBypassForScraping/
+shield-bypass/
+
+# 本地专属（skill 文档 / opencode 配置，仅本地保留）
+.opencode/
+opencode.json
+screenshots/
