@@ -181,6 +181,25 @@ def _backoff_delay(attempt: int, retry_after: float | None = None) -> float:
     return min(delay, RETRY_BACKOFF_MAX)
 
 
+def _proxy_rotation_enabled() -> bool:
+    """CHECKIN_PROXY_ROTATE（默认开）：是否复用代理池给签到 HTTP 轮换出口。"""
+    raw = (os.getenv("CHECKIN_PROXY_ROTATE", "1") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _build_http_opener(proxy: str, verify_ssl: bool) -> urllib.request.OpenerDirector:
+    """按出口代理与证书校验策略构造 urllib opener（出口轮换时可重建）。"""
+    handlers: list = []
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    if not verify_ssl:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        handlers.append(urllib.request.HTTPSHandler(context=ctx))
+    return urllib.request.build_opener(*handlers)
+
+
 # ────────────────────────── HTTP 客户端 ──────────────────────────
 
 class NewApiClient:
@@ -191,15 +210,16 @@ class NewApiClient:
         self.base_url = site.base_url.rstrip("/")
         self.referer = self.base_url + (site.referer_path if site.referer_path.startswith("/") else "/" + site.referer_path)
         self.proxy = site.proxy or os.getenv("CHECKIN_PROXY", "")
-        handlers: list = []
-        if self.proxy:
-            handlers.append(urllib.request.ProxyHandler({"http": self.proxy, "https": self.proxy}))
-        if not site.verify_ssl:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            handlers.append(urllib.request.HTTPSHandler(context=ctx))
-        self._opener = urllib.request.build_opener(*handlers)
+        self._verify_ssl = site.verify_ssl
+        # 无静态代理时，复用 Clash 订阅池（PROXY_POOL_URL / CHECKIN_PROXY_POOL）给签到
+        # HTTP 做出口轮换：命中 429 / 出口 IP 被封（waf_block）/ 网络超时时切下一个节点，
+        # 而不是在同一个出口 IP 上硬撞。静态代理（site.proxy / CHECKIN_PROXY）优先。
+        self._egress: EgressPool | None = None
+        if not self.proxy and _proxy_rotation_enabled():
+            pool_url = (os.getenv("CHECKIN_PROXY_POOL", "") or "").strip()
+            if pool_url:
+                self._egress = EgressPool(pool_url, lambda m: log(f"  [{site.name}] {m}"))
+        self._opener = _build_http_opener(self.proxy, self._verify_ssl)
 
     # -- 底层请求 --
     def request(self, method: str, path: str, body: dict | None = None) -> object:
@@ -223,6 +243,10 @@ class NewApiClient:
             data = json.dumps(body or {}).encode("utf-8")
             headers["Content-Type"] = "application/json;charset=UTF-8"
 
+        # 池化出口：首个请求前先取一个节点（无静态代理时惰性拉起；失败会置位停用）。
+        if not self.proxy and self._egress is not None:
+            self._rotate_egress()
+
         attempts = MAX_RETRIES + 1
         last_exc: Exception | None = None
         for attempt in range(attempts):
@@ -232,24 +256,36 @@ class NewApiClient:
                 # 4xx/5xx 是服务端应答：读出响应体用于分类
                 raw = exc.read().decode("utf-8", "replace")
                 err = self._as_api_error(exc.code, raw)
-                # 429/502/503/504 多为瞬时限流：按 Retry-After（如有）或指数退避重试
-                if exc.code in RETRYABLE_STATUS and attempt + 1 < attempts:
+                # 限流(429/5xx) 或出口 IP 被安全规则封禁(waf_block) → 换出口再试
+                if (exc.code in RETRYABLE_STATUS or err.kind == "waf_block") and attempt + 1 < attempts:
                     sleep_s = _backoff_delay(attempt, _retry_after_seconds(exc.headers))
-                    log(f"  [{self.site.name}] 服务端限流 HTTP {exc.code}，{sleep_s:.1f}s 后重试 ({attempt + 1}/{MAX_RETRIES})")
+                    rotated = self._rotate_egress()
+                    reason = "出口 IP 被封" if err.kind == "waf_block" else f"服务端限流 HTTP {exc.code}"
+                    egress = "已轮换出口" if rotated else "无可用轮换出口"
+                    log(f"  [{self.site.name}] {reason}，{egress}，{sleep_s:.1f}s 后重试 ({attempt + 1}/{MAX_RETRIES})")
                     time.sleep(sleep_s)
                     last_exc = ApiError(err.message, status=exc.code, payload=err.payload,
                                         kind=err.kind, transient=True)
                     continue
                 raise err from exc
-            except ApiError:
+            except ApiError as exc:
+                # JSON 层识别出的出口 IP 封禁同样值得换节点；挑战页(waf_challenge)需要浏览器，不在此处理
+                if exc.kind == "waf_block" and attempt + 1 < attempts and self._rotate_egress():
+                    sleep_s = _backoff_delay(attempt)
+                    log(f"  [{self.site.name}] 出口 IP 被封，已轮换出口，{sleep_s:.1f}s 后重试 ({attempt + 1}/{MAX_RETRIES})")
+                    time.sleep(sleep_s)
+                    last_exc = exc
+                    continue
                 raise
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_exc = exc
                 if attempt + 1 >= attempts:
                     break
-                # 超时 / 连接被断通常是出口被限流：指数退避 + 抖动，避免固定间隔硬撞
+                # 超时 / 连接被断通常是出口被限流：换出口 + 指数退避 + 抖动，避免固定出口硬撞
                 sleep_s = _backoff_delay(attempt)
-                log(f"  [{self.site.name}] 网络错误，{sleep_s:.1f}s 后重试 ({attempt + 1}/{MAX_RETRIES}): {exc}")
+                rotated = self._rotate_egress()
+                egress = "已轮换出口" if rotated else "保持当前出口"
+                log(f"  [{self.site.name}] 网络错误，{egress}，{sleep_s:.1f}s 后重试 ({attempt + 1}/{MAX_RETRIES}): {exc}")
                 time.sleep(sleep_s)
         if isinstance(last_exc, ApiError):
             raise last_exc
@@ -340,6 +376,31 @@ class NewApiClient:
         if payload.get("success") is False:
             raise ApiError(str(payload.get("message") or "接口返回失败"), payload=payload)
         return payload
+
+    # -- 出口轮换 --
+    def _rotate_egress(self) -> bool:
+        """把签到 HTTP 出口切到代理池的下一个节点；真正切换成功返回 True。"""
+        if self._egress is None:
+            return False
+        new_proxy = self._egress.next_proxy()
+        if not new_proxy:
+            return False
+        if new_proxy != self.proxy:
+            self.proxy = new_proxy
+            self._opener = _build_http_opener(self.proxy, self._verify_ssl)
+            log(f"  [{self.site.name}] 签到出口轮换 → {new_proxy}")
+        return True
+
+    def release_egress(self) -> None:
+        """停掉轮换节点（保留池，可再次惰性拉起），给浏览器探测腾出端口/内存。"""
+        if self._egress is not None:
+            self._egress.stop_all()
+
+    def close(self) -> None:
+        """站点处理结束时释放本客户端起的所有出口进程。"""
+        if self._egress is not None:
+            self._egress.stop_all()
+            self._egress = None
 
 
 # ────────────────────────── Turnstile 浏览器求解 ──────────────────────────
@@ -1122,6 +1183,8 @@ def retry_checkin_with_turnstile(client: NewApiClient, site: SiteConfig, exc: Ap
     pool_url = os.getenv("CHECKIN_PROXY_POOL", "").strip()
     if pool_url:
         log(f"{tag} 启用代理池模式（CHECKIN_PROXY_POOL 已配置）")
+        # 先释放 HTTP 出口轮换节点，避免与浏览器探测自起的 mihomo 争端口/内存
+        client.release_egress()
         try:
             return solve_turnstile_via_pool(client.base_url, sitekey, pool_url, headless, log_fn, auth)
         except ApiError:
@@ -1372,6 +1435,102 @@ def _get_pool_candidates(pool_url: str, binary: str, log_fn) -> list[dict]:
     return candidates
 
 
+class EgressPool:
+    """复用 Clash 订阅池（PROXY_POOL_URL）给**签到 HTTP**做出口轮换的轻量管理器。
+
+    与 Turnstile 的池模式同源（同一订阅、同一预筛），但用途不同：那里是
+    「多节点并发探测出令牌」，这里是「单站点请求失败时换一个出口 IP 重试」。
+
+    做法：预筛存活节点后，按需为当前节点起一个「钉死单节点」的 mihomo，
+    对外暴露 `http://127.0.0.1:<mixed-port>` 作为 HTTP 代理；每次 next_proxy()
+    切到下一个节点（惰性拉起，超量时停掉最旧的，避免进程/内存膨胀）。
+
+    - 节点全部不可用 / 无 mihomo 内核 / 池下载失败 → 自行停用，退化为直连；
+    - stop_all() 停掉已起实例但保留候选列表，后续可再次惰性拉起。
+    """
+
+    def __init__(self, pool_url: str, log_fn, binary: str | None = None,
+                 max_nodes: int | None = None, keep: int | None = None):
+        self.pool_url = pool_url
+        self.log_fn = log_fn
+        self.binary = (binary or os.getenv("MIHOMO_BIN", "mihomo") or "mihomo").strip()
+        self.max_nodes = max(1, int(max_nodes if max_nodes is not None
+                                    else (os.getenv("CHECKIN_PROXY_MAX_NODES", "12") or 12)))
+        self.keep = max(1, int(keep if keep is not None
+                               else (os.getenv("CHECKIN_PROXY_KEEP", "2") or 2)))
+        self._candidates: list[dict] = []
+        self._idx = 0
+        self._running: dict[str, _Mihomo] = {}
+        self._disabled = False
+
+    def _load(self) -> bool:
+        if self._disabled:
+            return False
+        if self._candidates:
+            return True
+        if shutil.which(self.binary) is None and not os.path.isfile(self.binary):
+            self.log_fn(
+                f"未找到 mihomo 内核（{self.binary}），签到出口轮换不可用，改用直连。"
+                "安装见 https://github.com/MetaCubeX/mihomo/releases 或设 MIHOMO_BIN"
+            )
+            self._disabled = True
+            return False
+        try:
+            self.log_fn("拉取代理池并预筛存活节点（供签到 HTTP 出口轮换）...")
+            nodes = _get_pool_candidates(self.pool_url, self.binary, self.log_fn)
+        except Exception as exc:
+            self.log_fn(f"代理池预筛失败（{type(exc).__name__}: {exc}），签到出口轮换不可用")
+            self._disabled = True
+            return False
+        self._candidates = nodes[: self.max_nodes]
+        if not self._candidates:
+            self.log_fn("代理池无存活节点，签到出口轮换不可用")
+            self._disabled = True
+            return False
+        self.log_fn(f"签到出口轮换就绪（{len(self._candidates)} 个候选节点）")
+        return True
+
+    def _start(self, node: dict) -> _Mihomo | None:
+        name = str(node.get("name") or f"node-{self._idx}")
+        m = _Mihomo(self.binary, f"http{len(self._running)}")
+        try:
+            m.start(_pool_worker_config(node, m), self.log_fn)
+        except Exception as exc:
+            self.log_fn(f"  出口节点启动失败 [{name[:24]}]: {type(exc).__name__}")
+            m.stop()
+            return None
+        self._running[name] = m
+        self._evict()
+        return m
+
+    def _evict(self) -> None:
+        while len(self._running) > self.keep:
+            oldest = next(iter(self._running))
+            self._running.pop(oldest).stop()
+
+    def next_proxy(self) -> str | None:
+        """切到下一个存活节点并返回其本地 HTTP 代理 URL；无可回退返回 None。"""
+        if not self._load():
+            return None
+        total = len(self._candidates)
+        for _ in range(total):
+            node = self._candidates[self._idx % total]
+            self._idx += 1
+            name = str(node.get("name") or "")
+            m = self._running.get(name)
+            if m is None:
+                m = self._start(node)
+                if m is None:
+                    continue
+            return f"http://127.0.0.1:{m.mixed_port}"
+        return None
+
+    def stop_all(self) -> None:
+        while self._running:
+            _, m = self._running.popitem()
+            m.stop()
+
+
 async def _pool_flow_async(base_url: str, sitekey: str, pool_url: str, headless: bool,
                            log_fn, auth: dict) -> dict:
     binary = os.getenv("MIHOMO_BIN", "mihomo").strip() or "mihomo"
@@ -1620,6 +1779,12 @@ def run_site(site: SiteConfig, *, probe_only: bool = False) -> Outcome:
     except Exception as exc:  # 兜底：未知异常不中断其他站点
         log(f"{tag} ✗ 未预期异常: {type(exc).__name__}")
         return Outcome(site.name, site.base_url, "error", f"{type(exc).__name__}")
+    finally:
+        # 释放本客户端起的轮换出口进程（mihomo），避免端口/内存泄漏
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 def to_usd(quota, site: SiteConfig) -> float | None:
@@ -1730,9 +1895,13 @@ def write_summary(outcomes: list[Outcome]) -> None:
 # ────────────────────────── 入口 ──────────────────────────
 
 def apply_shard(sites: list[SiteConfig]) -> list[SiteConfig]:
-    """按 CHECKIN_SHARD_TOTAL / CHECKIN_SHARD_INDEX 把站点分片。
-    用于把同一站点的多账号分摊到多次运行/多天，减少单次运行的出口压力。
-    默认不分片（TOTAL <= 1 时原样返回）。"""
+    """按 CHECKIN_SHARD_TOTAL / CHECKIN_SHARD_INDEX 分片，用于把**同一站点的多账号**
+    分摊到多次运行，避免单次运行把同一出口的请求打爆触发风控。
+
+    - 同一 `base_url` 有多个账号时：按账号顺序轮转分片，每轮只跑其中一部分；
+    - 单账号站点：每轮都跑（分片不影响它）。
+
+    默认不分片（`TOTAL <= 1` 时原样返回）。"""
     try:
         total = int(os.getenv("CHECKIN_SHARD_TOTAL", "1") or "1")
         index = int(os.getenv("CHECKIN_SHARD_INDEX", "0") or "0")
@@ -1743,7 +1912,18 @@ def apply_shard(sites: list[SiteConfig]) -> list[SiteConfig]:
         return sites
     if not 0 <= index < total:
         raise SystemExit(f"CHECKIN_SHARD_INDEX 必须在 [0, {total}) 内")
-    return [s for i, s in enumerate(sites) if i % total == index]
+
+    groups: dict[str, list[SiteConfig]] = {}
+    for s in sites:
+        groups.setdefault(s.base_url, []).append(s)
+
+    out: list[SiteConfig] = []
+    for members in groups.values():
+        if len(members) <= 1:
+            out.extend(members)
+        else:
+            out.extend(m for i, m in enumerate(members) if i % total == index)
+    return out
 
 
 def run_sites_sequential(sites: list[SiteConfig], *, probe_only: bool = False) -> list[Outcome]:
@@ -1768,7 +1948,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="多站点 New API 自动签到")
     parser.add_argument("--validate", action="store_true", help="校验配置并探测认证（不签到）")
     parser.add_argument("--name", help="只运行指定名称的站点")
-    parser.add_argument("--proxy-pool", default="", help="Clash 订阅池 URL（Turnstile 站点多节点并发探测）")
+    parser.add_argument("--proxy-pool", default="", help="Clash 订阅池 URL（Turnstile 多节点并发过盾 + 签到 HTTP 出口轮换）")
     args = parser.parse_args()
     if args.proxy_pool.strip():
         os.environ["CHECKIN_PROXY_POOL"] = args.proxy_pool.strip()

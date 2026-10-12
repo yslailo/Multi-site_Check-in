@@ -53,6 +53,26 @@ GET  /api/status                 → 取 turnstile_site_key
 - 探测阶段不发签到请求，只有胜者节点 POST 一次（避免多 IP 打同一账号）
 - 同一轮运行多站点共享预筛结果，胜出后其他 worker 立即收工
 
+### 签到 HTTP 出口轮换（复用同一订阅池）
+
+`PROXY_POOL_URL` / `CHECKIN_PROXY_POOL` 同时对**纯 HTTP 签到链路**生效：当站点返回 `429` /
+出口 IP 被封（Cloudflare `waf_block`）/ 网络超时/连接被断时，自动切到池里下一个存活节点的
+本地 mihomo 出口再试，而不是在同一个出口 IP 上硬撞（这是多账号连跑触发风控的主因之一）。
+
+```
+无静态代理 + 池可用
+  → 预筛存活节点（复用 Turnstile 池的同一预筛结果，TTL 30 分钟内复用）
+  → 首个请求前惰性拉起一个「钉死单节点」的 mihomo，作为 HTTP 出口
+  → 命中 429/5xx、waf_block、URLError/超时 → 停/换节点（next_proxy）→ 退避后重试
+  → 站点处理结束（含浏览器求解前）释放出口进程，避免端口/内存泄漏
+```
+
+- 静态代理优先：`site.proxy` / `CHECKIN_PROXY` 一旦配置，则不启用池化轮换
+- 需要 `mihomo` 内核（同 `MIHOMO_BIN`）；缺失时静默退化为直连，不影响签到
+- 出口轮换针对的是**请求层**风控（429/IP 封禁/超时）；`waf_challenge`（人机验证页）
+  仍需浏览器求解，交由上面的 Turnstile 池模式处理
+- 该轮换不伪造、不绕过验证：仅在池内已授权的自有代理节点间更换出口 IP
+
 ## 使用方法
 
 ### 第一步：采集凭据（每站 3 分钟，一次性）
@@ -109,7 +129,7 @@ python checkin.py --name gorouter    # 只跑一个站
 1. 仓库 **Settings → Secrets and variables → Actions → New repository secret**
 2. 添加 `ACCOUNTS`：整个 `ACCOUNTS.json` 的内容（JSON 文本）
 3. 可选：`TG_BOT_TOKEN` / `TG_CHAT_ID`（Telegram 通知）、`CHECKIN_PROXY`（出站代理）
-4. 可选：`PROXY_POOL_URL`（订阅池 URL，配置后 Turnstile 站点自动多节点并发过盾）
+4. 可选：`PROXY_POOL_URL`（订阅池 URL，配置后 Turnstile 站点自动多节点并发过盾，并给签到 HTTP 做出口轮换）
 5. 前往 **Actions** 启用 workflow，手动触发测试，后续每天会自动运行
 
 运行结果会写入 Step Summary 表格（站点 / 状态 / 说明 / 获得 / 余额）。
@@ -118,7 +138,10 @@ python checkin.py --name gorouter    # 只跑一个站
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `CHECKIN_PROXY_POOL` | 未设置 | Clash 订阅池 URL（CI 用 Secret `PROXY_POOL_URL` 注入） |
+| `CHECKIN_PROXY_POOL` | 未设置 | Clash 订阅池 URL（CI 用 Secret `PROXY_POOL_URL` 注入）；同时用于 Turnstile 过盾与签到 HTTP 出口轮换 |
+| `CHECKIN_PROXY_ROTATE` | `1` | 是否用池给签到 HTTP 轮换出口（`0/false/off` 关闭；静态代理存在时不生效） |
+| `CHECKIN_PROXY_MAX_NODES` | `12` | 出口轮换最多使用的候选节点数（按预筛延迟排序取前 N） |
+| `CHECKIN_PROXY_KEEP` | `2` | 同时保留的轮换 mihomo 实例上限（超出停最旧，控制进程/内存） |
 | `CHECKIN_POOL_CONCURRENCY` | `3` | 并发探测 worker 数（每 worker 一个浏览器 + mihomo，注意 runner 内存） |
 | `CHECKIN_POOL_MAX_NODES` | `24` | 单次运行最多探测的节点数 |
 | `CHECKIN_POOL_BUDGET_S` | `900` | 池探测总时间预算（秒） |
