@@ -8,6 +8,7 @@ import asyncio
 import datetime as dt
 import json
 import os
+import random
 import re
 import shutil
 import ssl
@@ -27,8 +28,12 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 QUOTA_PER_UNIT = 500000  # New API: quota / 500000 = 美元
-MAX_RETRIES = 2          # 仅网络层错误重试（业务失败不重试，避免重复 POST）
+MAX_RETRIES = 3          # 仅网络层/限流错误重试（业务失败不重试，避免重复 POST）
 RETRY_BACKOFF = 2.0
+RETRY_BACKOFF_MAX = 30.0   # 单次退避上限（秒）
+RETRY_JITTER = 1.5         # 退避随机抖动上限（秒），避免多账号整齐重撞限流窗口
+MAX_RETRY_AFTER = 120.0    # 尊重服务端 Retry-After，但不超过该值
+RETRYABLE_STATUS = {429, 502, 503, 504}  # 限流 / 瞬时服务端错误，退避后可重试
 
 # 签到状态分类词表（源自 newapi-checkin providers/base.py 的实测沉淀）
 ALREADY_DONE_PATTERNS = ["已签到", "今日已", "已领取", "明天再来", "already"]
@@ -152,6 +157,30 @@ def log(msg: str) -> None:
     print(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def _retry_after_seconds(headers) -> float | None:
+    """解析 Retry-After（秒数或 HTTP 日期），并夹在 [0, MAX_RETRY_AFTER] 内。"""
+    if not headers:
+        return None
+    raw = (headers.get("Retry-After") or "").strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        return min(float(raw), MAX_RETRY_AFTER)
+    try:
+        when = dt.datetime.strptime(raw, "%a, %d %b %Y %H:%M:%S %Z")
+    except ValueError:
+        return None
+    return min(max((when - dt.datetime.utcnow()).total_seconds(), 0.0), MAX_RETRY_AFTER)
+
+
+def _backoff_delay(attempt: int, retry_after: float | None = None) -> float:
+    """指数退避 + 抖动；服务端给了 Retry-After 就优先听它的。"""
+    if retry_after is not None:
+        return retry_after
+    delay = RETRY_BACKOFF * (2 ** attempt) + random.uniform(0.0, RETRY_JITTER)
+    return min(delay, RETRY_BACKOFF_MAX)
+
+
 # ────────────────────────── HTTP 客户端 ──────────────────────────
 
 class NewApiClient:
@@ -200,18 +229,30 @@ class NewApiClient:
             try:
                 return self._open(method, url, headers, data)
             except urllib.error.HTTPError as exc:
-                # 4xx/5xx 是服务端应答：不重试，读出响应体用于分类
+                # 4xx/5xx 是服务端应答：读出响应体用于分类
                 raw = exc.read().decode("utf-8", "replace")
-                raise self._as_api_error(exc.code, raw) from exc
+                err = self._as_api_error(exc.code, raw)
+                # 429/502/503/504 多为瞬时限流：按 Retry-After（如有）或指数退避重试
+                if exc.code in RETRYABLE_STATUS and attempt + 1 < attempts:
+                    sleep_s = _backoff_delay(attempt, _retry_after_seconds(exc.headers))
+                    log(f"  [{self.site.name}] 服务端限流 HTTP {exc.code}，{sleep_s:.1f}s 后重试 ({attempt + 1}/{MAX_RETRIES})")
+                    time.sleep(sleep_s)
+                    last_exc = ApiError(err.message, status=exc.code, payload=err.payload,
+                                        kind=err.kind, transient=True)
+                    continue
+                raise err from exc
             except ApiError:
                 raise
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_exc = exc
                 if attempt + 1 >= attempts:
                     break
-                sleep_s = RETRY_BACKOFF * (2 ** attempt)
-                log(f"  [{self.site.name}] 网络错误，{sleep_s:.0f}s 后重试 ({attempt + 1}/{MAX_RETRIES})")
+                # 超时 / 连接被断通常是出口被限流：指数退避 + 抖动，避免固定间隔硬撞
+                sleep_s = _backoff_delay(attempt)
+                log(f"  [{self.site.name}] 网络错误，{sleep_s:.1f}s 后重试 ({attempt + 1}/{MAX_RETRIES}): {exc}")
                 time.sleep(sleep_s)
+        if isinstance(last_exc, ApiError):
+            raise last_exc
         raise ApiError(f"网络错误: {last_exc}", transient=True)
 
     def _open(self, method: str, url: str, headers: dict, data: bytes | None) -> object:
@@ -1550,11 +1591,17 @@ def run_site(site: SiteConfig, *, probe_only: bool = False) -> Outcome:
                                "签到接口返回成功但未发放额度，站点也未标记已签到；可能需要在网页手动签到或接口已变更",
                                current_quota_usd=current_usd or quota_before_usd)
         else:
-            # 有奖励字段时也补一次当前余额，失败不致命
-            try:
-                current_usd = to_usd(client.fetch_user().get("quota"), site)
-            except Exception:
+            # 有奖励字段时不再多发请求：用「签到前余额 + 本次奖励」推导当前余额，
+            # 少一次 GET，降低同一出口的请求密度（实测这是触发限流的主因之一）。
+            if quota_before_usd is not None and awarded_usd is not None:
+                current_usd = round(quota_before_usd + awarded_usd, 6)
+            elif quota_before_usd is not None:
                 current_usd = quota_before_usd
+            else:
+                try:
+                    current_usd = to_usd(client.fetch_user().get("quota"), site)
+                except Exception:
+                    current_usd = None
 
         message = f"签到成功，获得额度：{fmt_usd(awarded_usd)}"
         log(f"{tag} ✓ {message}（当前: {fmt_usd(current_usd)}）")
@@ -1566,7 +1613,7 @@ def run_site(site: SiteConfig, *, probe_only: bool = False) -> Outcome:
         kind = classify_error(exc)
         hint = STATUS_HINTS.get(kind, "")
         message = f"{exc.message}" + (f"；{hint}" if hint else "")
-        log(f"{tag} ✗ {kind}")
+        log(f"{tag} ✗ {kind}: {exc.message}")
         # 对外结果只保留稳定提示，不透传接口原始 message，避免泄露用户信息。
         safe_message = hint or "请求失败，请检查站点状态"
         return Outcome(site.name, site.base_url, kind, safe_message)
@@ -1592,6 +1639,7 @@ def load_sites(path: str, only_name: str | None = None) -> list[SiteConfig]:
     if not isinstance(items, list):
         raise SystemExit("配置格式错误：应为 {\"accounts\": [...]} 或站点数组")
     sites = []
+    seen_keys: set = set()  # 同轮去重用
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -1615,6 +1663,13 @@ def load_sites(path: str, only_name: str | None = None) -> list[SiteConfig]:
         if not site.enabled:
             log(f"[{site.name}] 已禁用，跳过")
             continue
+        # 同轮去重：同一 (base_url, access_token) 只跑一次，避免同站点重复打 CF
+        # 触发限流（实测：同一站点 5 个相同账号连跑会在第 3 个起被 CF 429/超时拦截）
+        dedupe_key = (site.base_url.lower(), site.access_token)
+        if dedupe_key in seen_keys:
+            log(f"[{site.name}] 与已有站点重复（同 base_url+token），跳过")
+            continue
+        seen_keys.add(dedupe_key)
         sites.append(site)
     if only_name and not sites:
         raise SystemExit(f"未找到名为 {only_name!r} 的启用站点")
@@ -1674,6 +1729,41 @@ def write_summary(outcomes: list[Outcome]) -> None:
 
 # ────────────────────────── 入口 ──────────────────────────
 
+def apply_shard(sites: list[SiteConfig]) -> list[SiteConfig]:
+    """按 CHECKIN_SHARD_TOTAL / CHECKIN_SHARD_INDEX 把站点分片。
+    用于把同一站点的多账号分摊到多次运行/多天，减少单次运行的出口压力。
+    默认不分片（TOTAL <= 1 时原样返回）。"""
+    try:
+        total = int(os.getenv("CHECKIN_SHARD_TOTAL", "1") or "1")
+        index = int(os.getenv("CHECKIN_SHARD_INDEX", "0") or "0")
+    except ValueError:
+        log("CHECKIN_SHARD_TOTAL/INDEX 不是整数，忽略分片")
+        return sites
+    if total <= 1:
+        return sites
+    if not 0 <= index < total:
+        raise SystemExit(f"CHECKIN_SHARD_INDEX 必须在 [0, {total}) 内")
+    return [s for i, s in enumerate(sites) if i % total == index]
+
+
+def run_sites_sequential(sites: list[SiteConfig], *, probe_only: bool = False) -> list[Outcome]:
+    """串行执行；同一 base_url 的相邻账号之间插入随机间隔，避开站点限流窗口。"""
+    delay_min = float(os.getenv("CHECKIN_SITE_DELAY_MIN", "20") or "20")
+    delay_max = float(os.getenv("CHECKIN_SITE_DELAY_MAX", "45") or "45")
+    delay_max = max(delay_max, delay_min)
+
+    outcomes: list[Outcome] = []
+    prev_base: str | None = None
+    for site in sites:
+        if prev_base == site.base_url and delay_max > 0:
+            delay = random.uniform(delay_min, delay_max)
+            log(f"同一站点 {site.base_url} 连续签到，等待 {delay:.0f}s 以避开限流窗口")
+            time.sleep(delay)
+        outcomes.append(run_site(site, probe_only=probe_only))
+        prev_base = site.base_url
+    return outcomes
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="多站点 New API 自动签到")
     parser.add_argument("--validate", action="store_true", help="校验配置并探测认证（不签到）")
@@ -1689,8 +1779,10 @@ def main() -> int:
         log("没有启用站点，退出")
         return 1
 
+    sites = apply_shard(sites)
+
     log(f"共 {len(sites)} 个站点，模式: {'探测' if args.validate else '签到'}")
-    outcomes = [run_site(s, probe_only=args.validate) for s in sites]
+    outcomes = run_sites_sequential(sites, probe_only=args.validate)
 
     print("\n" + "=" * 62)
     ok = 0

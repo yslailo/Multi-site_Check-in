@@ -124,6 +124,19 @@ python checkin.py --name gorouter    # 只跑一个站
 | `CHECKIN_POOL_BUDGET_S` | `900` | 池探测总时间预算（秒） |
 | `MIHOMO_BIN` | `mihomo` | mihomo 内核路径（CI 的 workflow 会自动安装） |
 
+### 收敛请求 / 限流相关环境变量
+
+同一站点多个账号连跑时，出口 IP 易被站点风控限流（表现为 `network_error`：超时/连接被断，或 429/5xx）。以下变量用于**压低请求密度、尊重服务端限流**（非绕过）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `CHECKIN_SITE_DELAY_MIN` | `20` | 同一 `base_url` 相邻账号之间的最小随机间隔（秒） |
+| `CHECKIN_SITE_DELAY_MAX` | `45` | 最大随机间隔（秒）；设为 `0` 关闭间隔 |
+| `CHECKIN_SHARD_TOTAL` | `1` | 分片总数，把站点拆到多次运行；`>1` 时启用分片 |
+| `CHECKIN_SHARD_INDEX` | `0` | 当前分片下标，范围 `[0, CHECKIN_SHARD_TOTAL)` |
+
+网络层重试为指数退避 + 抖动，且会读取响应头 `Retry-After`（限流时优先听从）；`429/502/503/504` 视为瞬时限流可重试。有奖励字段时不再额外请求余额接口（用「签到前余额 + 本次奖励」推导），进一步减少请求数。
+
 ## 状态说明
 
 | 状态 | 含义 | 处理 |
@@ -134,10 +147,38 @@ python checkin.py --name gorouter    # 只跑一个站
 | `need_login` | 令牌失效（401） | 重新生成系统访问令牌 |
 | `need_verification` | Turnstile 求解失败 / WAF 拦截 | 检查日志中失败分类（600010=IP 被拒、rendered=信誉惩罚）；配置代理池或住宅代理 |
 | `not_open` | 站点未开放签到 | 无（站点侧问题） |
-| `network_error` | 临时网络失败 / 站点 5xx / 池探测失败 | 下次运行自动重试 |
+| `network_error` | 临时网络失败 / 站点 5xx / 限流（超时·连接被断·429） | 已自动退避重试；仍失败则下次运行重试，或调大 `CHECKIN_SITE_DELAY_*` / 用分片分摊 |
 | `error` | 业务拒绝或结果无法确认 | 查看日志详情 |
 
 ## 安全
 
 - `ACCOUNTS.json` 已被 `.gitignore` 忽略，只通过 GitHub Secret 传递
+
+## 安全研究工具箱：lucky_wheel/
+
+`lucky_wheel/` 是并入本仓库的**幸运大转盘 API 授权渗透测试工具包**（本地工具目录，已 `.gitignore`），与 `shield-bypass/`、`CloudflareBypassForScraping/` 等同为本地对照实现，不入库。
+
+针对目标 `https://hjmapi.923578.xyz` 的 `/api/user/lucky-wheel*`，一条命令覆盖从侦察到漏洞复现的全流程：
+
+```bash
+cd lucky_wheel
+pip install h2                      # 仅 h2 / h2multi 子命令需要
+
+# 配置（六选一）：config.json token / LW_TOKEN / --token / --browser 浏览器会话 / --auto 账密 / --accounts 长效令牌
+python lucky_wheel.py info                                  # 读取转盘状态（remaining/draws_today/daily_limit）
+python lucky_wheel.py --browser h2 -n 100                   # ★ 浏览器会话自动取 JWT + 并发复现，零手填零密码
+python lucky_wheel.py h2 -n 100                             # ★ HTTP/2 单连接 100 stream 并发（TOCTOU 复现，规避 429）
+python lucky_wheel.py info                                  # 复核：draws_today > daily_limit
+python lucky_wheel.py probe                                 # 限次/鉴权绕过探针（20 变体）
+python lucky_wheel.py auth                                  # JWT 签名校验测试
+python lucky_wheel.py jwt-crack --wordlist wordlists/jwt_common.txt
+```
+
+| 能力组 | 子命令 |
+|---|---|
+| 并发打点 | `race`（线程） / `burst`（裸 socket） / `h2`（推荐） / `h2multi` |
+| 侦察 | `probe` / `auth` / `routes` / `tls` / `replay` |
+| JWT 离线分析 | `jwt-decode` / `jwt-crack` / `jwt-none` / `jwt-forge` |
+
+工具包自带 `README.md`、`REPORT.md`（含已确认的 TOCTOU 限次绕过漏洞与修复建议）、`evidence/`（并发复现证据）、`poc/`（模块化版本，与统一 CLI 等价）。仅用于已授权目标的自有账号测试。
 
