@@ -13,6 +13,7 @@ __pycache__/
 newapi-checkin/
 CloudflareBypassForScraping/
 shield-bypass/
+lucky_wheel/
 
 # 本地专属（skill 文档 / opencode 配置，仅本地保留）
 .opencode/
